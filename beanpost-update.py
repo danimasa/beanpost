@@ -129,7 +129,7 @@ def update_transactions(cursor, entries):
             # Check if transaction already exists by matching date, payee, narration, and postings
             cursor.execute(
                 """
-                SELECT id FROM transaction WHERE date = %s AND payee = %s AND narration = %s
+                SELECT t.id FROM transaction as t INNER JOIN posting as p ON p.transaction_id = t.id WHERE p.date = %s AND t.payee = %s AND t.narration = %s
                 LIMIT 1
                 """,
                 (
@@ -216,8 +216,7 @@ def update_transactions(cursor, entries):
                 )
 
     # Re-match lots after updating transactions
-    cursor.execute(
-        """
+    cursor.execute("""
         WITH augmentations AS (
             SELECT * FROM posting WHERE (amount).number > 0
         )
@@ -231,8 +230,7 @@ def update_transactions(cursor, entries):
             LIMIT 1
         )
         WHERE (amount).number < 0
-        """
-    )
+        """)
 
     logging.info(f"  Inserted: {inserted_count}, Updated: {updated_count}")
 
