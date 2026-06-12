@@ -29,151 +29,83 @@ def get_meta_json(meta):
     return json.dumps(filtered_meta)
 
 
-def build_account_map(cursor):
-    """Build a map of account names to IDs from the database."""
-    cursor.execute("SELECT id, name FROM account")
-    account_map.clear()
-    for row in cursor.fetchall():
-        account_map[row[1]] = row[0]
+def truncate_all(cursor):
+    """Truncate all data tables to prepare for a full re-import.
+
+    Uses TRUNCATE ... CASCADE to handle foreign key dependencies.
+    The order doesn't matter with CASCADE, but we truncate child tables
+    first for clarity.
+    """
+    logging.info("Truncating all tables for full sync...")
+    cursor.execute("""
+        TRUNCATE posting, assertion, document, price, commodity, transaction, account
+        RESTART IDENTITY CASCADE
+    """)
+    logging.info("  All tables truncated.")
 
 
-def update_accounts(cursor, entries):
-    """Update or insert accounts from Open/Close directives."""
-    logging.info("Updating accounts...")
-    updated_count = 0
+def insert_accounts(cursor, entries):
+    """Insert all accounts from Open/Close directives."""
+    logging.info("Inserting accounts...")
     inserted_count = 0
 
-    # Process Open directives
+    # Collect Open directives
+    open_entries = {}
     for entry in entries:
         if isinstance(entry, data.Open):
-            meta = get_meta_json(entry.meta)
-            currencies = entry.currencies
+            open_entries[entry.account] = entry
 
-            if entry.account in account_map:
-                # Account exists, check if we need to update
-                account_id = account_map[entry.account]
-                cursor.execute(
-                    """
-                    SELECT open_date, currencies, meta FROM account WHERE id = %s
-                    """,
-                    (account_id,),
-                )
-                existing = cursor.fetchone()
-                if existing:
-                    existing_date, existing_currencies, existing_meta = existing
-                    # Update if any field changed
-                    if (
-                        entry.date != existing_date
-                        or currencies != existing_currencies
-                        or meta != existing_meta
-                    ):
-                        cursor.execute(
-                            """
-                            UPDATE account SET open_date = %s, currencies = %s, meta = %s
-                            WHERE id = %s
-                            """,
-                            (entry.date, currencies, meta, account_id),
-                        )
-                        updated_count += 1
-            else:
-                # New account, insert it
-                new_id = max(account_map.values()) + 1 if account_map else 1
-                cursor.execute(
-                    """
-                    INSERT INTO account (id, name, open_date, currencies, meta)
-                    VALUES (%s, %s, %s, %s, %s)
-                    """,
-                    (new_id, entry.account, entry.date, currencies, meta),
-                )
-                account_map[entry.account] = new_id
-                inserted_count += 1
-
-    # Process Close directives
+    # Collect Close directives
+    close_dates = {}
     for entry in entries:
         if isinstance(entry, data.Close):
-            if entry.account in account_map:
-                account_id = account_map[entry.account]
-                cursor.execute(
-                    "SELECT close_date FROM account WHERE id = %s", (account_id,)
-                )
-                existing = cursor.fetchone()
-                if existing and existing[0] != entry.date:
-                    cursor.execute(
-                        "UPDATE account SET close_date = %s WHERE id = %s",
-                        (entry.date, account_id),
-                    )
-                    updated_count += 1
-                elif not existing[0]:
-                    cursor.execute(
-                        "UPDATE account SET close_date = %s WHERE id = %s",
-                        (entry.date, account_id),
-                    )
-                    updated_count += 1
+            close_dates[entry.account] = entry.date
 
-    logging.info(f"  Inserted: {inserted_count}, Updated: {updated_count}")
+    # Insert all accounts
+    for account_name, entry in open_entries.items():
+        meta = get_meta_json(entry.meta)
+        currencies = entry.currencies
+        close_date = close_dates.get(account_name)
+
+        cursor.execute(
+            """
+            INSERT INTO account (name, open_date, close_date, currencies, meta)
+            VALUES (%s, %s, %s, %s, %s)
+            RETURNING id
+            """,
+            (account_name, entry.date, close_date, currencies, meta),
+        )
+        account_id = cursor.fetchone()[0]
+        account_map[account_name] = account_id
+        inserted_count += 1
+
+    logging.info(f"  Inserted: {inserted_count}")
 
 
-def update_transactions(cursor, entries):
-    """Update or insert transactions and postings."""
-    logging.info("Updating transactions...")
-    updated_count = 0
-    inserted_count = 0
+def insert_transactions(cursor, entries):
+    """Insert all transactions and their postings."""
+    logging.info("Inserting transactions...")
+    txn_count = 0
+    posting_count = 0
 
-    # Get existing transaction IDs to avoid conflicts
-    cursor.execute("SELECT MAX(id) FROM transaction")
-    result = cursor.fetchone()
-    max_id = (result[0] or 0) if result else 0
-
-    for eid, entry in enumerate(entries, start=max_id + 1):
+    for entry in entries:
         if isinstance(entry, data.Transaction):
-            # Check if transaction already exists by matching date, payee, narration, and postings
             cursor.execute(
                 """
-                SELECT t.id FROM transaction as t INNER JOIN posting as p ON p.transaction_id = t.id WHERE p.date = %s AND t.payee = %s AND t.narration = %s
-                LIMIT 1
+                INSERT INTO transaction (flag, payee, narration, tags, links)
+                VALUES (%s, %s, %s, %s, %s)
+                RETURNING id
                 """,
                 (
-                    entry.date,
+                    entry.flag or "",
                     entry.payee or "",
                     entry.narration or "",
+                    str(sorted(entry.tags)) if entry.tags else "",
+                    str(sorted(entry.links)) if entry.links else "",
                 ),
             )
-            existing_txn = cursor.fetchone()
-
-            if existing_txn:
-                txn_id = existing_txn[0]
-                # Update transaction metadata
-                cursor.execute(
-                    """
-                    UPDATE transaction SET flag = %s, tags = %s, links = %s
-                    WHERE id = %s
-                    """,
-                    (entry.flag or "", list(entry.tags), list(entry.links), txn_id),
-                )
-                updated_count += 1
-
-                # Update postings - delete old ones and insert new ones for this transaction
-                cursor.execute(
-                    "DELETE FROM posting WHERE transaction_id = %s", (txn_id,)
-                )
-            else:
-                # Insert new transaction
-                cursor.execute(
-                    """
-                    INSERT INTO transaction (id, flag, payee, narration, tags, links)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                    """,
-                    (
-                        eid,
-                        entry.flag or "",
-                        entry.payee or "",
-                        entry.narration or "",
-                        list(entry.tags),
-                        list(entry.links),
-                    ),
-                )
-                txn_id = eid
-                inserted_count += 1
+            txn_id = cursor.fetchone()[0]
+            txn_count += 1
 
             # Insert postings for this transaction
             posting_values = []
@@ -214,8 +146,9 @@ def update_transactions(cursor, entries):
                     """,
                     posting_values,
                 )
+                posting_count += len(posting_values)
 
-    # Re-match lots after updating transactions
+    # Match lots after all postings are inserted
     cursor.execute("""
         WITH augmentations AS (
             SELECT * FROM posting WHERE (amount).number > 0
@@ -232,20 +165,15 @@ def update_transactions(cursor, entries):
         WHERE (amount).number < 0
         """)
 
-    logging.info(f"  Inserted: {inserted_count}, Updated: {updated_count}")
+    logging.info(f"  Inserted: {txn_count} transactions, {posting_count} postings")
 
 
-def update_balances(cursor, entries):
-    """Update or insert balance assertions."""
-    logging.info("Updating balances...")
-    updated_count = 0
+def insert_balances(cursor, entries):
+    """Insert all balance assertions."""
+    logging.info("Inserting balance assertions...")
     inserted_count = 0
 
-    cursor.execute("SELECT MAX(id) FROM assertion")
-    result = cursor.fetchone()
-    max_id = (result[0] or 0) if result else 0
-
-    for eid, entry in enumerate(entries, start=max_id + 1):
+    for entry in entries:
         if isinstance(entry, data.Balance):
             account_id = account_map.get(entry.account)
             if account_id is None:
@@ -255,152 +183,66 @@ def update_balances(cursor, entries):
                 continue
 
             amount = get_amount(entry.amount)
-
-            # Check if assertion already exists
             cursor.execute(
                 """
-                SELECT id FROM assertion WHERE date = %s AND account_id = %s
-                LIMIT 1
+                INSERT INTO assertion (date, account_id, amount)
+                VALUES (%s, %s, %s)
                 """,
-                (entry.date, account_id),
+                (entry.date, account_id, amount),
             )
-            existing = cursor.fetchone()
+            inserted_count += 1
 
-            if existing:
-                assertion_id = existing[0]
-                cursor.execute(
-                    """
-                    SELECT amount FROM assertion WHERE id = %s
-                    """,
-                    (assertion_id,),
-                )
-                existing_amount = cursor.fetchone()[0]
-                if amount != existing_amount:
-                    cursor.execute(
-                        """
-                        UPDATE assertion SET amount = %s WHERE id = %s
-                        """,
-                        (amount, assertion_id),
-                    )
-                    updated_count += 1
-            else:
-                cursor.execute(
-                    """
-                    INSERT INTO assertion (id, date, account_id, amount)
-                    VALUES (%s, %s, %s, %s)
-                    """,
-                    (eid, entry.date, account_id, amount),
-                )
-                inserted_count += 1
-
-    logging.info(f"  Inserted: {inserted_count}, Updated: {updated_count}")
+    logging.info(f"  Inserted: {inserted_count}")
 
 
-def update_prices(cursor, entries):
-    """Update or insert prices."""
-    logging.info("Updating prices...")
-    updated_count = 0
+def insert_prices(cursor, entries):
+    """Insert all prices."""
+    logging.info("Inserting prices...")
     inserted_count = 0
 
-    cursor.execute("SELECT MAX(id) FROM price")
-    result = cursor.fetchone()
-    max_id = (result[0] or 0) if result else 0
-
-    for eid, entry in enumerate(entries, start=max_id + 1):
+    for entry in entries:
         if isinstance(entry, data.Price):
             amount = get_amount(entry.amount)
-
-            # Check if price already exists
             cursor.execute(
                 """
-                SELECT id FROM price WHERE date = %s AND currency = %s AND amount = %s
-                LIMIT 1
+                INSERT INTO price (date, currency, amount)
+                VALUES (%s, %s, %s)
                 """,
                 (entry.date, entry.currency, amount),
             )
-            existing = cursor.fetchone()
+            inserted_count += 1
 
-            if not existing:
-                cursor.execute(
-                    """
-                    INSERT INTO price (id, date, currency, amount)
-                    VALUES (%s, %s, %s, %s)
-                    """,
-                    (eid, entry.date, entry.currency, amount),
-                )
-                inserted_count += 1
-
-    logging.info(f"  Inserted: {inserted_count}, Updated: {updated_count}")
+    logging.info(f"  Inserted: {inserted_count}")
 
 
-def update_commodities(cursor, entries):
-    """Update or insert commodities."""
-    logging.info("Updating commodities...")
-    updated_count = 0
+def insert_commodities(cursor, entries):
+    """Insert all commodities."""
+    logging.info("Inserting commodities...")
     inserted_count = 0
 
-    cursor.execute("SELECT MAX(id) FROM commodity")
-    result = cursor.fetchone()
-    max_id = (result[0] or 0) if result else 0
-
-    for eid, entry in enumerate(entries, start=max_id + 1):
+    for entry in entries:
         if isinstance(entry, data.Commodity):
             decimal_places = entry.meta.pop("decimal_places", 0)
             meta = get_meta_json(entry.meta)
-
-            # Check if commodity already exists
             cursor.execute(
                 """
-                SELECT id FROM commodity WHERE currency = %s
-                LIMIT 1
+                INSERT INTO commodity (date, currency, decimal_places, meta)
+                VALUES (%s, %s, %s, %s)
                 """,
-                (entry.currency,),
+                (entry.date, entry.currency, decimal_places, meta),
             )
-            existing = cursor.fetchone()
+            inserted_count += 1
 
-            if existing:
-                commodity_id = existing[0]
-                cursor.execute(
-                    """
-                    SELECT date, decimal_places, meta FROM commodity WHERE id = %s
-                    """,
-                    (commodity_id,),
-                )
-                existing_data = cursor.fetchone()
-                if (
-                    existing_data[0] != entry.date
-                    or existing_data[1] != decimal_places
-                    or existing_data[2] != meta
-                ):
-                    cursor.execute(
-                        """
-                        UPDATE commodity SET date = %s, decimal_places = %s, meta = %s
-                        WHERE id = %s
-                        """,
-                        (entry.date, decimal_places, meta, commodity_id),
-                    )
-                    updated_count += 1
-            else:
-                cursor.execute(
-                    """
-                    INSERT INTO commodity (id, date, currency, decimal_places, meta)
-                    VALUES (%s, %s, %s, %s, %s)
-                    """,
-                    (eid, entry.date, entry.currency, decimal_places, meta),
-                )
-                inserted_count += 1
-
-    logging.info(f"  Inserted: {inserted_count}, Updated: {updated_count}")
+    logging.info(f"  Inserted: {inserted_count}")
 
 
-def update_documents(cursor, entries):
-    """Update or insert documents."""
+def insert_documents(cursor, entries):
+    """Insert all documents."""
     if document_path is None:
         logging.info("No documents directory configured, skipping documents")
         return
 
-    logging.info("Updating documents...")
-    updated_count = 0
+    logging.info("Inserting documents...")
     inserted_count = 0
 
     def read_data(filename):
@@ -408,11 +250,7 @@ def update_documents(cursor, entries):
         with open(filename, "rb") as file:
             return file.read()
 
-    cursor.execute("SELECT MAX(id) FROM document")
-    result = cursor.fetchone()
-    max_id = (result[0] or 0) if result else 0
-
-    for eid, entry in enumerate(entries, start=max_id + 1):
+    for entry in entries:
         if isinstance(entry, data.Document):
             account_id = account_map.get(entry.account)
             if account_id is None:
@@ -420,54 +258,25 @@ def update_documents(cursor, entries):
                 continue
 
             filename = str(Path(entry.filename).relative_to(document_path))
-
-            # Check if the document already exists in the database
+            file_data = read_data(entry.filename)
             cursor.execute(
                 """
-                SELECT id FROM document WHERE date = %s AND filename = %s LIMIT 1
+                INSERT INTO document (date, account_id, filename, data)
+                VALUES (%s, %s, %s, %s)
                 """,
-                (entry.date, filename),
+                (entry.date, account_id, filename, file_data),
             )
-            existing = cursor.fetchone()
+            inserted_count += 1
 
-            if existing:
-                # Document exists, update account_id if changed
-                cursor.execute(
-                    """
-                    SELECT account_id FROM document WHERE id = %s
-                    """,
-                    (existing[0],),
-                )
-                existing_account_id = cursor.fetchone()[0]
-                if existing_account_id != account_id:
-                    cursor.execute(
-                        """
-                        UPDATE document SET account_id = %s WHERE id = %s
-                        """,
-                        (account_id, existing[0]),
-                    )
-                    updated_count += 1
-            else:
-                # New document, insert it
-                file_data = read_data(entry.filename)
-                cursor.execute(
-                    """
-                    INSERT INTO document (id, date, account_id, filename, data)
-                    VALUES (%s, %s, %s, %s, %s)
-                    """,
-                    (eid, entry.date, account_id, str(filename), file_data),
-                )
-                inserted_count += 1
-
-    logging.info(f"  Inserted: {inserted_count}, Updated: {updated_count}")
+    logging.info(f"  Inserted: {inserted_count}")
 
 
 def main():
     global document_path
 
     parser = version.ArgumentParser(
-        description="Update a Beanpost database with data from a Beancount file. "
-        "Checks for new values and updates existing ones if they change."
+        description="Sync a Beanpost database with data from a Beancount file. "
+        "Replaces all database content to match the Beancount file exactly."
     )
     parser.add_argument("filename", help="Beancount input filename")
     parser.add_argument("database", help="PostgreSQL connection string")
@@ -489,26 +298,28 @@ def main():
     cursor = connection.cursor()
 
     try:
-        logging.info("Building account map from database...")
-        build_account_map(cursor)
+        # Truncate everything first for a clean sync
+        with misc_utils.log_time("truncate_all", logging.info):
+            truncate_all(cursor)
 
+        # Insert everything from the beancount file
         for function in [
-            update_accounts,
-            update_transactions,
-            update_balances,
-            update_prices,
-            update_commodities,
-            update_documents,
+            insert_accounts,
+            insert_transactions,
+            insert_balances,
+            insert_prices,
+            insert_commodities,
+            insert_documents,
         ]:
             step_name = getattr(function, "__name__", function.__class__.__name__)
             with misc_utils.log_time(step_name, logging.info):
                 function(cursor, entries)
 
         connection.commit()
-        logging.info("Update completed successfully")
+        logging.info("Sync completed successfully")
     except Exception as e:
         connection.rollback()
-        logging.error(f"Error during update: {e}")
+        logging.error(f"Error during sync: {e}")
         raise
     finally:
         cursor.close()
